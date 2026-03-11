@@ -1,5 +1,5 @@
 """
-app.py  —  BBB Avatar Maker  |  Stage 2  |  VERSION 3.2
+app.py  —  BBB Avatar Maker  |  Stage 2  |  VERSION 3.3
 ═══════════════════════════════════════════════════════════════════════════════
 VERSION HISTORY
   v1.0  Initial build — Flask + APScheduler + debug UI
@@ -10,7 +10,13 @@ VERSION HISTORY
   v3.1  Corrected API field names (Set-A payload: name/opening/prompt only)
   v3.2  Renamed HEYGEN_* env vars → AVATAR_KEY_CLASSIC / AVATAR_URL_CLASSIC
         Renamed HeyGenKBClient → ClassicKBClient
-        No "HeyGen" brand names in code, config, or UI (counter-checked against live docs):
+        No "HeyGen" brand names in code, config, or UI
+  v3.3  Fixes:
+        1. TEST dummy body now reads Avatar_Type from CSV column
+           (was hardcoded to Type-2 — caused Type-1 rows to route wrong)
+        2. stage2_log.csv header auto-migrated from 6-col to 8-col on first write
+        3. Removed hardcoded SP cross-check (sp.edu.sg) from CSV loader
+        4. Removed SP cross-check block from process_inbox() (counter-checked against live docs):
           TYPE-1 HeyGen Knowledge Base — confirmed from docs + real working code:
             ✅ Payload fields:  name, opening, prompt   (3 fields only)
             ✗ REMOVED:         description              (not a valid field)
@@ -116,7 +122,7 @@ log = logging.getLogger("bbb3")
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════════
-APP_VERSION = "3.2"
+APP_VERSION = "3.3"
 APP_NAME    = "BBB Avatar Maker — Stage 2"
 
 # ── Type-2: Live Avatar ────────────────────────────────────────────────────
@@ -248,17 +254,6 @@ def load_csv() -> List[Dict[str, str]]:
         log.info("[CSV] ── Last row (used in TEST mode) ─────────────────")
         for k, v in rows[-1].items():
             log.info("[CSV]   %-14s : %s", k, v)
-        # Cross-check SP entry
-        sp_rows = [r for r in rows
-                   if "sp.edu.sg" in (r.get("Web_URL") or "").lower()
-                   or (r.get("Company") or "").strip().upper() == "SP"]
-        if sp_rows:
-            log.info("[CSV] ✔ SP entry found:")
-            for r in sp_rows:
-                log.info("[CSV]   Sl_No=%s  Email=%s  Web=%s",
-                         r.get("Sl_No"), r.get("Email"), r.get("Web_URL"))
-        else:
-            log.warning("[CSV] ⚠ No SP entry found (expected sp.edu.sg row)")
     return rows
 
 
@@ -276,12 +271,23 @@ def append_run_log(shortname: str, company: str, email_addr: str,
         now      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         new_row  = (f'{now},"{company}","{shortname}","{email_addr}",'
                     f'"{context_name}","{avatar_type}","{web_scrap}","{status}"\n')
+        HEADER_V3 = ("Timestamp,Company,ShortName,Email,"
+                     "ContextName,AvatarType,WebScrap,Status\n")
         if not existing.strip():
-            header   = ("Timestamp,Company,ShortName,Email,"
-                        "ContextName,AvatarType,WebScrap,Status\n")
-            new_text = header + new_row
+            # File empty or missing — write fresh with v3 header
+            new_text = HEADER_V3 + new_row
         else:
-            new_text = existing.rstrip("\n") + "\n" + new_row
+            lines = existing.strip().splitlines()
+            current_header = lines[0] if lines else ""
+            if current_header != HEADER_V3.strip():
+                # Old 6-col header detected — migrate to v3 8-col header
+                log.warning("[RunLog] ⚠ Old header detected — migrating to v3 schema")
+                log.warning("[RunLog]   Old: %s", current_header)
+                log.warning("[RunLog]   New: %s", HEADER_V3.strip())
+                data_rows = "\n".join(lines[1:])   # keep all existing data rows
+                new_text  = HEADER_V3 + (data_rows + "\n" if data_rows else "") + new_row
+            else:
+                new_text = existing.rstrip("\n") + "\n" + new_row
         gh_put(LOG_PATH, new_text, sha,
                f"v3 log: {shortname} type={avatar_type} {status}")
         log.info("[RunLog] ✔ stage2_log.csv updated on GitHub")
@@ -1024,10 +1030,19 @@ def process_inbox(test_mode: bool = False) -> None:
 
         log.info("[Job] TEST MODE — using last CSV row: %s  (%s)", company, web_url)
 
+        # Read Avatar_Type from CSV column, normalise to "Type-1" or "Type-2"
+        csv_avatar_raw = (last.get("Avatar_Type") or "").strip()
+        if re.sub(r"[^0-9]", "", csv_avatar_raw) == "1":
+            test_avatar_type = "Type-1"
+        else:
+            test_avatar_type = "Type-2"   # safe default
+        log.info("[Job] TEST Avatar_Type from CSV: %r → %s",
+                 csv_avatar_raw, test_avatar_type)
+
         # Build a synthetic email body that matches v3 format
         dummy_body = (
             f"# Dataset   = {shortname.upper()}TEST\n"
-            f"# Avatar    = Type-2\n"
+            f"# Avatar    = {test_avatar_type}\n"
             f"# Web-scrap = Success\n\n"
             f"# Dataset = {shortname.upper()}TEST\n\n"
             f"## Opening Intro\n"
@@ -1066,15 +1081,6 @@ def process_inbox(test_mode: bool = False) -> None:
         log.info("[Job]   %-35s  Sl_No=%-3s  %-25s  %s",
                  addr, r.get("Sl_No", "?"),
                  r.get("Company", "?"), r.get("Web_URL", "?"))
-
-    # SP cross-check
-    sp = next((r for r in rows
-               if (r.get("Company") or "").strip().upper() == "SP"), None)
-    if sp:
-        sp_email = (sp.get("Email") or "").strip().lower()
-        flag = "✔ IS registered" if sp_email in registered else "✘ NOT in registered!"
-        log.info("[Job] SP cross-check: Sl_No=%s  Email=%s  → %s",
-                 sp.get("Sl_No"), sp_email, flag)
 
     # Scan Gmail
     matching = gmail_scan_matching(registered)
